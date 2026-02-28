@@ -6,7 +6,8 @@ from pathlib import Path
 from datetime import datetime
 import discord
 from discord.ext import commands
-
+from enum import Enum
+from tqdm import tqdm
 
 def load_env_from_file(path=".env"):
     p = Path(path)
@@ -54,222 +55,197 @@ def default_backup_options(method, mode):
         normalized_mode = "rapido"
     return normalized_method, normalized_mode
 
+# Extracts overwrite from channel-like types
+def extract_overwrites(chs):
+    return [{str(k): { "allow": v.pair()[0].value, "deny": v.pair()[1].value }} for k,v in chs.overwrites.items()]
 
-async def backup_guild_structure(guild, backup_dir):
-    info = {
-        "guild_id": guild.id,
-        "guild_name": guild.name,
+# Obtains the guild structure
+# Permission Set for this function: [NONE]
+async def get_guild_structure(guild):
+    # Permission: NONE
+    base = {
+        "id": guild.id,
+        "name": guild.name,
         "owner_id": guild.owner_id,
         "member_count": guild.member_count,
         "created_at": guild.created_at.isoformat(),
     }
-    roles = []
-    for role in guild.roles:
-        roles.append(
-            {
-                "id": role.id,
-                "name": role.name,
-                "position": role.position,
-                "permissions": role.permissions.value,
-                "color": role.color.value,
-                "hoist": role.hoist,
-                "mentionable": role.mentionable,
-                "managed": role.managed,
-            }
-        )
-    categories = []
-    for category in guild.categories:
-        overwrites = {}
-        for target, overwrite in category.overwrites.items():
-            overwrites[str(target.id)] = {
-                "allow": overwrite.pair()[0].value,
-                "deny": overwrite.pair()[1].value,
-            }
-        categories.append(
-            {
-                "id": category.id,
-                "name": category.name,
-                "position": category.position,
-                "overwrites": overwrites,
-            }
-        )
-    channels = []
-    for channel in guild.text_channels:
-        overwrites = {}
-        for target, overwrite in channel.overwrites.items():
-            overwrites[str(target.id)] = {
-                "allow": overwrite.pair()[0].value,
-                "deny": overwrite.pair()[1].value,
-            }
-        channels.append(
-            {
-                "id": channel.id,
-                "name": channel.name,
-                "category_id": channel.category.id if channel.category else None,
-                "position": channel.position,
-                "topic": channel.topic,
-                "nsfw": channel.is_nsfw(),
-                "slowmode_delay": channel.slowmode_delay,
-                "overwrites": overwrites,
-            }
-        )
-    emojis = []
-    for emoji in guild.emojis:
-        emojis.append(
-            {
-                "id": emoji.id,
-                "name": emoji.name,
-                "animated": emoji.animated,
-                "url": str(emoji.url),
-            }
-        )
-    structure = {
-        "info": info,
+
+    # Permission: NONE
+    roles = [
+        {
+            "id": role.id,
+            "name": role.name,
+            "position": role.position,
+            "permissions": role.permissions.value,
+            "color": role.color.value,
+            "hoist": role.hoist,
+            "mentionable": role.mentionable,
+            "managed" : role.managed,
+         } for role in guild.roles ]
+    # Permission: NONE
+    categories = [
+        {
+            "id": x.id,
+            "name": x.name,
+            "position": x.position,
+            "overwrites": extract_overwrites(x)
+        } for x in guild.categories ]
+    # Permission: NONE
+    channels = [
+        {
+            "id": x.id,
+            "name": x.name,
+            "category_id": x.category.id if x.category else None,
+            "position": x.position,
+            "topic": x.topic,
+            "nsfw": x.is_nsfw(),
+            "slowmode_delay": x.slowmode_delay,
+            "overwrites": extract_overwrites(x)
+        } for x in guild.text_channels ]
+    # Permission: NONE
+    emojis = [
+        {
+            "id": x.id,
+            "name": x.name,
+            "animated": x.animated,
+            "url": str(x.url)
+        } for x in guild.emojis]
+
+    return {
+        "info": base,
         "roles": roles,
-        "categories": categories,
+        "categories":categories,
         "channels": channels,
         "emojis": emojis,
         "version": 1,
     }
-    structure_path = backup_dir / "backup_structure.json"
-    with open(structure_path, "w", encoding="utf-8") as f:
-        json.dump(structure, f, ensure_ascii=False, indent=2)
-    return structure_path
 
 
-async def backup_messages_txt(guild, backup_dir, mode, progress_msg):
-    text_channels = guild.text_channels
-    total_channels = len(text_channels)
-    completed_channels = 0
+class FileKind(Enum):
+    GUILD_STRUCTURE_JSON = 1
+    BACKUP_JSON = 2
+    FILE_ATTACHMENT = 3
+
+async def save_file(kind, base_dir, data, extra=None):
+    def save_json(path, data):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    path = None
+
+    if kind is FileKind.GUILD_STRUCTURE_JSON:
+        path = base_dir / "backup_structure.json"
+        save_json(path, data)
+    elif kind is FileKind.FILE_ATTACHMENT:
+        path = base_dir / f"{extra}_{data.filename}"
+        await data.save(path)
+    elif kind is FileKind.BACKUP_JSON:
+        path = base_dir / "backup_data.json"
+        save_json(path, data)
+    return path
+
+async def backup_guild_structure(guild, backup_dir):
+   structure = await get_guild_structure(guild)
+   return save_file(FileKind.GUILD_STRUCTURE_JSON, backup_dir, structure)
+
+# Here base_dir is the channel media directory.
+# Said directory MUST exist before calling this function
+async def save_attachments(message, base_dir):
+    for att in message.attachments:
+        await save_file(FileKind.FILE_ATTACHMENT, base_dir, att, extra=message.id)
+
+# Transforms a message into a .TXT file immediately appending it to the log file.
+# Here log_file is a file-like object that allows appending into the end of itself.
+# Said file MUST exist before calling this function
+# Note to selves: *Maybe* this is a micro-optimization, cause we could collect all messages into RAM
+# but for *really* large discords that might be impossible? I dont know.
+# It is done "streaming" here because of possibility that some random discord server
+# could bloat enough UTF8 data to OOM. Scary! And we certainly wouldn't wanna be in that server lel. 
+async def transform_txt(message, log_file):
+    timestamp = message.created_at.isoformat()
+    author = f"{message.author} ({message.author.id})"
+    content = message.clean_content or ""
+    log_file.write(f"[{timestamp}] {author}: {content}\n")
+    for (idx,embed) in enumerate(message.embeds):
+        log_file.write(f"[EMBED {idx}] {json.dumps(embed.to_dict(), ensure_ascii=False)}\n")
+
+# Transforms a message into a dict that can then be collected as a list
+# Here base_dir is the channel media directory.
+# It is not needed that the directory be created before calling this function
+# since it is a pure function.
+# Fuck, can JSON even be saved in a streamable way? Maybe `transform_txt` is a microop afterall. 
+def transform_dict(message, base_dir):
+    return {
+        "id": message.id,
+        "author_id": message.author.id,
+        "author_tag": str(message.author),
+        "content": message.clean_content or "",
+        "created_at": message.created_at.isoformat(),
+        "embeds": [embed.to_dict() for embed in message.embeds],
+        "attachments": [{
+            "filename": x.filename,
+            "saved_path": base_dir / message.id + "_" + x.filename
+        } for x in message.attachments]
+    }
+
+
+
+async def backup_messages_txt(guild, backup_dir):
+    # Thats just handrolling TQDM...
+    # Iona like it. 
     media_dir = backup_dir / "media"
     logs_dir = backup_dir / "logs"
+    # Maybe os.makedirs? is recursive and recursive betterer
     media_dir.mkdir(exist_ok=True)
     logs_dir.mkdir(exist_ok=True)
 
-    async def progress_updater():
-        while completed_channels < total_channels:
-            bar = generate_progress_bar(completed_channels, total_channels)
-            await progress_msg.edit(content=f"📨 Backup messaggi TXT: {bar}")
-            await asyncio.sleep(2)
+    for channel in tqdm(guild.text_channels, desc="[TXT] Discord Channels"):
+        safe_name = sanitize_name(channel.name) or str(channel.id)
+        log_path = logs_dir / f"{safe_name}.txt"
+        ch_media_dir = media_dir / safe_name
+        ch_media_dir.mkdir(exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as log:
+            async for message in channel.history(oldest_first=True, limit=None):
+                await transform_txt(message, log)
+                await save_attachments(message, ch_media_dir)
 
-    updater_task = asyncio.create_task(progress_updater())
-
-    try:
-        for channel in text_channels:
-            safe_name = sanitize_name(channel.name) or str(channel.id)
-            log_path = logs_dir / f"{safe_name}.txt"
-            channel_media_dir = media_dir / safe_name
-            channel_media_dir.mkdir(exist_ok=True)
-            try:
-                limit = None
-                if mode == "rapido":
-                    limit = 500
-                history_kwargs = {"limit": limit, "oldest_first": True}
-                with open(log_path, "w", encoding="utf-8") as f:
-                    async for msg in channel.history(**history_kwargs):
-                        timestamp = msg.created_at.isoformat()
-                        author = f"{msg.author} ({msg.author.id})"
-                        content = msg.clean_content or ""
-                        f.write(f"[{timestamp}] {author}: {content}\n")
-                        if msg.embeds:
-                            for idx, embed in enumerate(msg.embeds, start=1):
-                                embed_dict = embed.to_dict()
-                                f.write(f"[EMBED {idx}] {json.dumps(embed_dict, ensure_ascii=False)}\n")
-                        if mode == "full":
-                            for att in msg.attachments:
-                                try:
-                                    target = channel_media_dir / att.filename
-                                    await att.save(target)
-                                    f.write(f"[ATTACHMENT] {att.filename} -> {target.as_posix()}\n")
-                                except Exception as e:
-                                    f.write(f"[ATTACHMENT ERROR] {att.filename} - {e}\n")
-            except Exception as e:
-                error_log = logs_dir / "errors.txt"
-                with open(error_log, "a", encoding="utf-8") as ef:
-                    ef.write(f"Errore salvataggio canale {channel.id} ({channel.name}): {e}\n")
-            completed_channels += 1
-    finally:
-        updater_task.cancel()
-
-
-async def backup_messages_json(guild, backup_dir, mode, progress_msg):
-    text_channels = guild.text_channels
-    total_channels = len(text_channels)
-    completed_channels = 0
+async def backup_messages_json(guild, backup_dir):
     media_dir = backup_dir / "media"
+    logs_dir = backup_dir / "logs"
+
     media_dir.mkdir(exist_ok=True)
-    data = {
+    logs_dir.mkdir(exist_ok=True)
+
+    base = {
         "guild_id": guild.id,
         "created_at": datetime.utcnow().isoformat(),
-        "mode": mode,
+        "mode": "full",
         "channels": [],
         "version": 1,
     }
 
-    async def progress_updater():
-        while completed_channels < total_channels:
-            bar = generate_progress_bar(completed_channels, total_channels)
-            await progress_msg.edit(content=f"📨 Backup messaggi JSON: {bar}")
-            await asyncio.sleep(2)
+    for channel in tqdm(guild.text_channels, desc="[JSON] Discord Channels"):
+        safe_name = sanitize_name(channel.name) or str(channel.id)
+        log_path = logs_dir / f"{safe_name}.txt"
+        ch_media_dir = media_dir / safe_name
+        ch_media_dir.mkdir(exist_ok=True)
 
-    updater_task = asyncio.create_task(progress_updater())
+        ch_entry = {
+            "id": channel.id,
+            "name": channel.name,
+            "category_id": channel.category.id if channel.category else None,
+            "messages": [],
+        }
 
-    try:
-        for channel in text_channels:
-            safe_name = sanitize_name(channel.name) or str(channel.id)
-            channel_media_dir = media_dir / safe_name
-            channel_media_dir.mkdir(exist_ok=True)
-            channel_entry = {
-                "id": channel.id,
-                "name": channel.name,
-                "category_id": channel.category.id if channel.category else None,
-                "messages": [],
-            }
-            try:
-                limit = None
-                if mode == "rapido":
-                    limit = 500
-                history_kwargs = {"limit": limit, "oldest_first": True}
-                async for msg in channel.history(**history_kwargs):
-                    msg_payload = {
-                        "id": msg.id,
-                        "author_id": msg.author.id,
-                        "author_tag": str(msg.author),
-                        "content": msg.clean_content or "",
-                        "created_at": msg.created_at.isoformat(),
-                        "embeds": [embed.to_dict() for embed in msg.embeds],
-                        "attachments": [],
-                    }
-                    if mode == "full":
-                        for att in msg.attachments:
-                            attachment_path = channel_media_dir / att.filename
-                            try:
-                                await att.save(attachment_path)
-                                msg_payload["attachments"].append(
-                                    {
-                                        "filename": att.filename,
-                                        "saved_path": str(attachment_path.relative_to(backup_dir)),
-                                    }
-                                )
-                            except Exception as e:
-                                msg_payload["attachments"].append(
-                                    {
-                                        "filename": att.filename,
-                                        "error": str(e),
-                                    }
-                                )
-                    channel_entry["messages"].append(msg_payload)
-            except Exception as e:
-                channel_entry["error"] = str(e)
-            data["channels"].append(channel_entry)
-            completed_channels += 1
-    finally:
-        updater_task.cancel()
-    data_path = backup_dir / "backup_data.json"
-    with open(data_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    return data_path
+        async for message in channel.history(oldest_first=True, limit=None):
+            transformed = transform_dict(message, ch_media_dir)
+            ch_entry["messages"].append(transformed)
+            await save_attachments(message, ch_media_dir)
 
+        base["channels"].append(ch_entry)
+
+    return save_file(FileKind.BACKUP_JSON, backup_dir, base)
 
 async def backup_messages_db(guild, backup_dir, mode, progress_msg):
     db_path = backup_dir / "backup.db"
@@ -293,7 +269,7 @@ async def backup_messages_db(guild, backup_dir, mode, progress_msg):
     async def progress_updater():
         while completed_channels < total_channels:
             bar = generate_progress_bar(completed_channels, total_channels)
-            await progress_msg.edit(content=f"📨 Backup messaggi DB: {bar}")
+            await progress_msg.edit(content=f"Saving messsages to DB: {bar}")
             await asyncio.sleep(2)
 
     updater_task = asyncio.create_task(progress_updater())
@@ -351,7 +327,7 @@ async def backup_messages_db(guild, backup_dir, mode, progress_msg):
                         channel.id,
                         0,
                         "system",
-                        f"Errore durante il backup del canale {channel.id} ({channel.name}): {e}",
+                        f"Error during the backup of the channel {channel.id} ({channel.name}): {e}",
                         datetime.utcnow().isoformat(),
                     ),
                 )
@@ -371,8 +347,8 @@ async def create_metadata_file(backup_dir, guild, method, mode, structure_path, 
         "created_at": timestamp,
         "method": method,
         "mode": mode,
-        "structure_file": str(structure_path.name),
-        "data_file": str(data_path.name) if data_path else None,
+        "structure_file": str(structure_path),
+        "data_file": str(data_path) if data_path else None,
         "version": 1,
     }
     safe_name = sanitize_name(guild.name) or str(guild.id)
@@ -382,38 +358,37 @@ async def create_metadata_file(backup_dir, guild, method, mode, structure_path, 
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return meta_path
 
-
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def backup(ctx, metodo: str = None, tipo: str = None):
+async def backup(ctx, method: str = None):
     guild = ctx.guild
-    method, mode = default_backup_options(metodo, tipo)
+    method, mode = default_backup_options(method, None)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     safe_name = sanitize_name(guild.name) or str(guild.id)
     backup_dir = Path(f"backup_{safe_name}_{timestamp}")
     backup_dir.mkdir(exist_ok=True)
-    description = f"Metodo: {method.upper()} • Modalità: {mode.upper()}"
-    progress_msg = await ctx.send(f"📦 Avvio backup di **{guild.name}**\n{description}")
+    description = f"Method: {method.upper()} • Mode: {mode.upper()}"
+    progress_msg = await ctx.send(f"📦 Starting backup of **{guild.name}**\n{description}")
     structure_path = await backup_guild_structure(guild, backup_dir)
-    await progress_msg.edit(content=f"📁 Struttura server salvata\n{description}")
+    await progress_msg.edit(content=f"📁 Saved server structure\n{description}")
     data_path = None
     if method == "txt":
-        await backup_messages_txt(guild, backup_dir, mode, progress_msg)
+        await backup_messages_txt(guild, backup_dir)
     elif method == "json":
-        data_path = await backup_messages_json(guild, backup_dir, mode, progress_msg)
+        data_path = await backup_messages_json(guild, backup_dir)
     elif method == "db":
         data_path = await backup_messages_db(guild, backup_dir, mode, progress_msg)
     meta_path = await create_metadata_file(backup_dir, guild, method, mode, structure_path, data_path)
     from discord import Embed
     embed = Embed(
-        title="✅ Backup completato",
-        description="Il backup del server è stato completato con successo.",
+        title="✅ Backup complete",
+        description="The server backup was completed sucessfuly.",
         color=discord.Color.green(),
     )
-    embed.add_field(name="Metodo", value=method.upper(), inline=True)
-    embed.add_field(name="Modalità", value=mode.upper(), inline=True)
-    embed.add_field(name="File metadati", value=str(meta_path.name), inline=False)
-    embed.set_footer(text="Usa !restorebackup <nomefile> per ripristinare da questo backup")
+    embed.add_field(name="Method", value=method.upper(), inline=True)
+    embed.add_field(name="Mode", value=mode.upper(), inline=True)
+    embed.add_field(name="File Metadata", value=str(meta_path.name), inline=False)
+    embed.set_footer(text="Use !restorebackup <file name> for restoring a server from the backup.")
     await progress_msg.edit(content=None, embed=embed)
 
 
@@ -422,30 +397,35 @@ async def backup(ctx, metodo: str = None, tipo: str = None):
 async def restorebackup(ctx, nomefile: str):
     guild = ctx.guild
     if not ctx.author.guild_permissions.administrator:
-        await ctx.send("❌ Devi essere amministratore per usare questo comando.")
+        await ctx.send("❌ You need to have `Administrator` permissions for running this command.")
         return
+    ## WARNING: This isn't strictly necessary. But its easier to give a bot admin perms, then remove it from the server
+    ## WARNING: The set of permissions needed for this bot to run will be checked afterwards, since I don't wanna do it now.
     if not guild.me.guild_permissions.administrator:
-        await ctx.send("❌ Il bot deve avere permessi di amministratore per ripristinare un backup.")
+        await ctx.send("❌ The bot needs `Administrator` permissions to run this command.")
         return
     base = Path(nomefile)
     if not base.is_absolute():
         base = Path.cwd() / base
     if base.is_dir():
-        await ctx.send("❌ Specifica il file dei metadati JSON, non una cartella.")
+        # What the fuck is latin-2 going on. Holy hell. Cartella is "Folder".... 
+        await ctx.send("❌ The provided path was an folder. Expected the metadata `.json` file.")
         return
     if base.suffix.lower() != ".json":
         base = base.with_suffix(".json")
     if not base.exists():
+        # ????
         await ctx.send(f"❌ File di backup non trovato: {base.name}")
         return
     try:
         with open(base, "r", encoding="utf-8") as f:
             meta = json.load(f)
     except Exception:
-        await ctx.send("❌ Impossibile leggere il file di metadati JSON.")
+        await ctx.send("❌ Could not read the metadata file.")
         return
+    # Is this behaviour I want? Why would you make a backup of a community if you don't plan to move it. 
     if str(meta.get("guild_id")) != str(guild.id):
-        await ctx.send("❌ Questo backup appartiene a un altro server.")
+        await ctx.send("❌ This backup was made for another server.")
         return
     method = meta.get("method", "json").lower()
     data_file_name = meta.get("data_file")
@@ -612,5 +592,5 @@ async def restorebackup(ctx, nomefile: str):
 load_env_from_file()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("Imposta la variabile di ambiente DISCORD_BOT_TOKEN con il token del bot.")
+    raise RuntimeError("Missing DISCORD_BOT_TOKEN environment variable.")
 bot.run(TOKEN)
