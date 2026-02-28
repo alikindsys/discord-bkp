@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "discord-bkp"
+version = "0.1.0"
+
+[project]
+name = "discord-bkp"
+version = "0.1.0"
+description = "Discord Backup Tool Thing"
+authors = [
+    {name = "alikindsys",email = "alice@blocovermelho.org"}
+]
+license = {text = "GPL-3"}
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "discord-py (>=2.7.0,<3.0.0)",
+    "tqdm (>=4.67.3,<5.0.0)"
+]
+
+[tool.poetry.dependencies]
+python = "^3.13"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
